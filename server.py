@@ -42,7 +42,8 @@ class Player:
         self.on_ground = False
         self.alive = True
         self.dead_timer = 0.0
-        self.attack_cooldown = 0.0
+        self.gun_cooldown = 0.0
+        self.melee_cooldown = 0.0
         self.melee_active = False
         self.melee_timer = 0.0
         self.melee_hit_set = set()
@@ -274,7 +275,7 @@ class GameServer:
             for p in self.players.values():
                 if not p.alive:
                     continue
-                pr = 20 * (2 if "giant" in p.buffs else 1)
+                pr = 35 * (2 if "giant" in p.buffs else 1)
                 dx = (p.x + PLAYER_W // 2) - i.x
                 dy = (p.y + PLAYER_H // 2) - i.y
                 if dx * dx + dy * dy <= pr * pr:
@@ -294,15 +295,15 @@ class GameServer:
             t = random.choices(useful, weights=ws, k=1)[0]
             print(f"  -> 重新随机为 {t}")
         if t == "speed":
-            p.buffs["speed"] = 10.0
+            p.buffs["speed"] = 6.0
         elif t == "shield":
-            p.buffs["shield"] = 10.0
+            p.buffs["shield"] = 20.0
         elif t == "heal":
             p.hp = min(PLAYER_MAX_HP, p.hp + 40)
         elif t == "explosive":
             p.buffs["explosive"] = 1.0
         elif t == "giant":
-            p.buffs["giant"] = 20.0
+            p.buffs["giant"] = 15.0
 
 
     def update_player(self, p: Player, dt: float):
@@ -312,8 +313,10 @@ class GameServer:
             if p.dead_timer <= 0:
                 self.respawn(p)
             return
-        if p.attack_cooldown > 0:
-            p.attack_cooldown -= dt
+        if p.gun_cooldown > 0:
+            p.gun_cooldown -= dt
+        if p.melee_cooldown > 0:
+            p.melee_cooldown -= dt
         if p.melee_active:
             p.melee_timer -= dt
             if p.melee_timer <= 0:
@@ -340,6 +343,7 @@ class GameServer:
             if p.buffs[bkey] <= 0:
                 del p.buffs[bkey]
         speed_mult = 1.75 if "speed" in p.buffs else 1.0
+        speed_mult *= 0.5 if "slow" in p.buffs else 1.0
         speed_mult *= 0.5 if "giant" in p.buffs else 1.0
         jump_mult = 1.25 if "speed" in p.buffs else 1.0
         if p.knockback_timer <= 0:
@@ -376,10 +380,10 @@ class GameServer:
             self.kill_player(p, None)
             return
         if p.weapon == 0:
-            if p.attack and not p.prev_attack and p.attack_cooldown <= 0:
+            if p.attack and not p.prev_attack and p.melee_cooldown <= 0:
                 self.melee_attack(p)
         else:
-            if p.attack and not p.prev_attack and p.attack_cooldown <= 0:
+            if p.attack and not p.prev_attack and p.gun_cooldown <= 0:
                 self.gun_attack(p)
         p.prev_attack = p.attack
 
@@ -405,7 +409,7 @@ class GameServer:
     def melee_attack(self, p: Player):
         p.melee_active = True
         p.melee_timer = MELEE_ACTIVE_TIME
-        p.attack_cooldown = MELEE_COOLDOWN
+        p.melee_cooldown = MELEE_COOLDOWN
         p.melee_hit_set.clear()
         is_giant = "giant" in p.buffs
         giant_s = 1.5 if is_giant else 1.0
@@ -436,11 +440,12 @@ class GameServer:
                     other.vy = -290.0 * kb
                     other.vx = 1200.0 * p.facing * kb
                     other.knockback_timer = 0.5
+                    other.buffs["slow"] = 3.0
                     other.knockback_drag = 2400.0 / kb
                 p.melee_hit_set.add(other.id)
 
     def gun_attack(self, p: Player):
-        p.attack_cooldown = GUN_COOLDOWN
+        p.gun_cooldown = GUN_COOLDOWN
         bx = p.x + PLAYER_W if p.facing == 1 else p.x - BULLET_W
         by = p.y + PLAYER_H // 2 - BULLET_H // 2
         bvx = BULLET_SPEED * _BASE_TICK * p.facing
@@ -457,22 +462,43 @@ class GameServer:
         for b in self.bullets:
             if b.explosive and abs(b.init_vx) > 10:
                 age = (now - b.spawn_time) / 0.6
-                speed_mult = 1.0 + min(age, 1.0) * 4.0
+                speed_mult = 1.0 + min(age, 1.0) * 2.0
                 b.vx = b.init_vx * speed_mult
+                # 追踪最近的敌人
+                target = None
+                target_dist2 = float('inf')
+                for p in self.players.values():
+                    if p.id == b.owner_id or not p.alive:
+                        continue
+                    dx = (p.x + PLAYER_W // 2) - b.x
+                    dy = (p.y + PLAYER_H // 2) - b.y
+                    d2 = dx * dx + dy * dy
+                    if d2 < target_dist2:
+                        target_dist2 = d2
+                        target = p
+                if target:
+                    dx = (target.x + PLAYER_W // 2) - b.x
+                    dy = (target.y + PLAYER_H // 2) - b.y
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist > 1:
+                        turn_power = 300 + 300000 / max(dist, 10)
+                        b.vx += (dx / dist) * turn_power * dt
+                        b.vy += (dy / dist) * turn_power * dt
             b.x += b.vx * dt
             b.y += b.vy * dt
             if b.x + BULLET_W < 0 or b.x > MAP_WIDTH or b.y + BULLET_H < 0 or b.y > MAP_HEIGHT:
                 continue
             if now - b.spawn_time > BULLET_LIFETIME:
                 continue
-            hit_plat = False
-            for plat in PLATFORMS:
-                px, py, pw, ph = plat
-                if b.x + BULLET_W > px and b.x < px + pw and b.y + BULLET_H > py and b.y < py + ph:
-                    hit_plat = True
-                    break
-            if hit_plat:
-                continue
+            if not b.explosive:
+                hit_plat = False
+                for plat in PLATFORMS:
+                    px, py, pw, ph = plat
+                    if b.x + BULLET_W > px and b.x < px + pw and b.y + BULLET_H > py and b.y < py + ph:
+                        hit_plat = True
+                        break
+                if hit_plat:
+                    continue
             hit_player = False
             for p in self.players.values():
                 if p.id == b.owner_id or not p.alive:
@@ -519,10 +545,10 @@ class GameServer:
                             p.knockback_timer = 0.6
                             p.knockback_drag = 800.0 / kb
                         else:
-                            p.vy = -180.0 * kb
-                            p.vx = 500.0 * (1 if b.vx >= 0 else -1) * kb
-                            p.knockback_timer = 0.35
-                            p.knockback_drag = 1600.0 / kb
+                            p.vy = -280.0 * kb
+                            p.vx = 750.0 * (1 if b.vx >= 0 else -1) * kb
+                            p.knockback_timer = 0.4
+                            p.knockback_drag = 1200.0 / kb
                     if p.hp <= 0:
                         killer = self.players.get(b.owner_id)
                         self.kill_player(p, killer)
@@ -558,7 +584,8 @@ class GameServer:
         p.alive = True
         p.on_ground = False
         p.dead_timer = 0.0
-        p.attack_cooldown = 0.0
+        p.gun_cooldown = 0.0
+        p.melee_cooldown = 0.0
         p.melee_active = False
         p.melee_hit_set.clear()
         p.can_double_jump = True

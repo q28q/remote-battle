@@ -605,15 +605,15 @@ class GameClient:
         items = getattr(self, '_state_items', [])
         for it in items:
             x, y = it["x"], it["y"]
-            # 发光方块
+            # 发光方块（放大尺寸）
             col = (180, 140, 255)
-            for r in range(8, 0, -2):
-                s = pygame.Surface((r*3, r*3), pygame.SRCALPHA)
-                s.fill((*col, 25))
-                surf.blit(s, (x - r*1.5, y - r*1.5))
-            sz = 10
+            for r in range(12, 0, -3):
+                s = pygame.Surface((r*4, r*4), pygame.SRCALPHA)
+                s.fill((*col, 30))
+                surf.blit(s, (x - r*2, y - r*2))
+            sz = 18
             pygame.draw.rect(surf, col, (x - sz//2, y - sz//2, sz, sz))
-            pygame.draw.rect(surf, (255,255,255), (x - sz//2, y - sz//2, sz, sz), 1)
+            pygame.draw.rect(surf, (255,255,255), (x - sz//2, y - sz//2, sz, sz), 2)
 
     def draw_bullets(self, surf: pygame.Surface):
         for b in self.bullets:
