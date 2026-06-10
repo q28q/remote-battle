@@ -1,26 +1,31 @@
 """
-LAN Platform Battle — 游戏服务器 (TCP)
+LAN Platform Battle — 游戏服务器 (UDP)
 2D 平台跳跃 + 近战/枪械 权威服务器
+
+UDP 通信层由 network.UdpNode 提供：
+  - 位置/状态同步 → 低可靠（最多重传 2 次）
+  - 击杀事件        → 高可靠（seq + ACK，保证有序必达）
 """
 import socket
-import select
 import json
 import time as _time_module
 import math
 import random
 import sys
+import threading
 
 _clock = _time_module.monotonic
 
 sys.path.insert(0, ".")
 from config import *
+from network import UdpNode
 
 
 class Player:
-    def __init__(self, pid: int, sock: socket.socket, name: str):
+    def __init__(self, pid: int, addr: tuple, name: str):
         sp = random.choice(SPAWN_POINTS)
         self.id = pid
-        self.sock = sock
+        self.addr = addr          # (ip, port) — UDP 对端地址
         self.name = name[:10]
         self.x, self.y = float(sp[0]), float(sp[1])
         self.vx = 0.0
@@ -29,7 +34,6 @@ class Player:
         self.hp = PLAYER_MAX_HP
         self.kills = 0
         self.deaths = 0
-        # 颜色在 handle_join 中由服务器分配
         self.color: tuple[int, int, int] = (255, 255, 255)
         self.last_active = _clock()
         self.input_left = False
@@ -68,15 +72,18 @@ class Bullet:
 class Item:
     """从空中掉落的道具方块"""
     TYPES = ("speed", "shield", "heal", "explosive", "giant")
-    WEIGHTS = (4, 4, 2, 4, 2)  # 护盾 = 加速 = 爆裂 > 回血 = 巨大化
+    WEIGHTS = (4, 4, 2, 4, 2)
+
     def __init__(self, x: float, y: float, vy: float = 60.0):
         self.x = x; self.y = y; self.vy = vy
         self.spawn_time = _clock()
+
     @property
     def type(self):
         return random.choices(self.TYPES, weights=self.WEIGHTS, k=1)[0]
 
-def _random_player_color(existing: list[tuple[int,int,int]]) -> tuple[int,int,int]:
+
+def _random_player_color(existing: list[tuple[int, int, int]]) -> tuple[int, int, int]:
     for _ in range(50):
         r, g, b = random.randint(60, 255), random.randint(60, 255), random.randint(60, 255)
         if r > 200 and g > 100 and b < 100:
@@ -90,9 +97,9 @@ def _random_player_color(existing: list[tuple[int,int,int]]) -> tuple[int,int,in
                 break
         if ok:
             return (r, g, b)
-    return (random.randint(100,255), random.randint(100,255), random.randint(100,255))
+    return (random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
 
-# 物理每秒常量（原常量按 30 tick/s 标定，换算到每秒）
+
 _BASE_TICK = 30.0
 _SPEED_PS = PLAYER_SPEED * _BASE_TICK
 _GRAVITY_PS = GRAVITY * _BASE_TICK ** 2
@@ -104,112 +111,71 @@ class GameServer:
     def __init__(self, port: int = SERVER_PORT):
         self.port = port
         self.players: dict[int, Player] = {}
-        self.sock_to_pid: dict[socket.socket, int] = {}
+        self.addr_to_pid: dict[str, int] = {}  # "ip:port" -> pid
         self.bullets: list[Bullet] = []
         self.kill_feed: list[str] = []
         self.running = False
-        self.server_sock: socket.socket | None = None
-        self.disc_sock: socket.socket | None = None
+        self.node: UdpNode | None = None
         self._next_pid = 1
-        self._pending_socks: list[socket.socket] = []
-        self._recv_buf: dict[socket.socket, bytes] = {}
         self.items: list[Item] = []
         self._next_item_spawn = _clock() + 3.0
+        self._last_tick = _clock()
+        self._pending_kill_events: list[dict] = []
 
-    # ── TCP 收发 ──
+    # ── 消息收发（UDP 封装） ──
 
-    # 标记：连接已断开（与"暂无完整消息"的 None 区分）
-    _DISCONNECTED = object()
+    def send_to(self, addr: tuple, data: dict, reliable: bool = True):
+        if self.node:
+            self.node.send(addr, data, reliable=reliable)
 
-    @staticmethod
-    def _send_all(sock: socket.socket, data: bytes):
-        sock.sendall(len(data).to_bytes(4, 'big') + data)
-
-    def _recv_msg(self, sock: socket.socket) -> dict | None | object:
-        """从缓冲区提取一条消息。返回 dict=成功, None=等待更多数据, _DISCONNECTED=断开"""
-        buf = self._recv_buf.get(sock, b'')
-        try:
-            chunk = sock.recv(4096)
-            if chunk:
-                buf += chunk
-                self._recv_buf[sock] = buf
-            else:
-                return self._DISCONNECTED
-        except BlockingIOError:
-            pass
-        except OSError:
-            return self._DISCONNECTED
-        if len(buf) < 4:
-            return None
-        n = int.from_bytes(buf[:4], 'big')
-        if len(buf) < 4 + n:
-            return None
-        body = buf[4:4 + n]
-        self._recv_buf[sock] = buf[4 + n:]
-        try:
-            return json.loads(body.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-
-    def send_to(self, sock: socket.socket, data: dict):
-        try:
-            payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-            self._send_all(sock, payload)
-        except OSError:
-            pass
-
-    def broadcast(self, data: dict):
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    def broadcast(self, data: dict, reliable: bool = False):
+        if not self.node:
+            return
         for p in list(self.players.values()):
-            try:
-                self._send_all(p.sock, payload)
-            except OSError as e:
-                print(f"  [广播失败] {p.name}(ID={p.id}) {e}")
+            self.node.send(p.addr, data, reliable=reliable)
 
     # ── 消息处理 ──
 
-    def _handle_discover(self, sock: socket.socket):
-        """处理 UDP LAN 发现"""
-        try:
-            data, addr = sock.recvfrom(4096)
-            msg = json.loads(data.decode("utf-8"))
-            if msg.get("type") == "discover":
-                resp = json.dumps({"type": "here"}).encode("utf-8")
-                sock.sendto(resp, addr)
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-    def handle_message(self, sock: socket.socket, msg: dict):
+    def handle_message(self, addr: tuple, msg: dict):
         t = msg.get("type", "")
         if t == "join":
-            self.handle_join(sock, msg)
+            self.handle_join(addr, msg)
         elif t == "input":
-            self.handle_input(sock, msg)
+            self.handle_input(addr, msg)
         elif t == "disconnect":
-            self._remove_by_sock(sock, is_disconnect=True)
+            self._remove_by_addr(addr, is_disconnect=True)
 
-    def handle_join(self, sock: socket.socket, msg: dict):
-        if sock in self.sock_to_pid:
+    def handle_join(self, addr: tuple, msg: dict):
+        key = f"{addr[0]}:{addr[1]}"
+        # 已有此玩家 → 重发 welcome（客户端可能丢了 welcome）
+        if key in self.addr_to_pid:
+            pid = self.addr_to_pid[key]
+            p = self.players.get(pid)
+            if p:
+                p.last_active = _clock()
+                self.send_to(addr, {
+                    "type": "welcome", "pid": p.id,
+                    "color": list(p.color), "server_tick": TICK_RATE,
+                }, reliable=True)
             return
         if len(self.players) >= MAX_PLAYERS:
-            self.send_to(sock, {"type": "error", "message": "服务器已满"})
+            self.send_to(addr, {"type": "error", "message": "服务器已满"}, reliable=True)
             return
         name = msg.get("name", f"玩家{self._next_pid}")
-        p = Player(self._next_pid, sock, name)
+        p = Player(self._next_pid, addr, name)
         self._next_pid += 1
         p.color = _random_player_color([pl.color for pl in self.players.values()])
         self.players[p.id] = p
-        self.sock_to_pid[sock] = p.id
-        if sock in self._pending_socks:
-            self._pending_socks.remove(sock)
-        self.send_to(sock, {
+        self.addr_to_pid[key] = p.id
+        self.send_to(addr, {
             "type": "welcome", "pid": p.id,
             "color": list(p.color), "server_tick": TICK_RATE,
-        })
+        }, reliable=True)
         print(f"[+] {p.name}(ID={p.id}) 加入  在线: {len(self.players)}人")
 
-    def handle_input(self, sock: socket.socket, msg: dict):
-        pid = self.sock_to_pid.get(sock)
+    def handle_input(self, addr: tuple, msg: dict):
+        key = f"{addr[0]}:{addr[1]}"
+        pid = self.addr_to_pid.get(key)
         if pid is None:
             return
         p = self.players.get(pid)
@@ -229,30 +195,25 @@ class GameServer:
         if f in (-1, 1):
             p.facing = f
 
-
-    def _remove_by_sock(self, sock: socket.socket, is_disconnect: bool = False):
-        pid = self.sock_to_pid.pop(sock, None)
+    def _remove_by_addr(self, addr: tuple, is_disconnect: bool = False):
+        key = f"{addr[0]}:{addr[1]}"
+        pid = self.addr_to_pid.pop(key, None)
         if pid is not None:
             p = self.players.get(pid)
             name = p.name if p else f"#{pid}"
             self.remove_player(pid, is_disconnect=is_disconnect)
             print(f"[-] {name}(ID={pid}) {'主动断开' if is_disconnect else '断开'}")
-        elif sock in self._pending_socks:
-            self._pending_socks.remove(sock)
-        self._recv_buf.pop(sock, None)
-        try:
-            sock.close()
-        except OSError:
-            pass
+        # 清理该地址残留的待重传消息（通过 drop_queue 传递到网络线程）
+        if self.node:
+            self.node.drop_peer(addr)
 
-    # ── 游戏逻辑（与 UDP 版一致）──
+    # ── 游戏逻辑 ──
 
     def tick(self):
         now = _clock()
-        dt = now - getattr(self, '_last_tick', now)
+        dt = now - self._last_tick
         self._last_tick = now
         dt = min(dt, 0.1)
-        # 道具生成
         self._update_items(now)
         for p in self.players.values():
             self.update_player(p, dt)
@@ -270,7 +231,6 @@ class GameServer:
             sx = random.uniform(50, MAP_WIDTH - 50)
             self.items.append(Item(sx, -30.0, vy=random.uniform(30, 60)))
             self._next_item_spawn = now + random.uniform(5.0, 8.0)
-        # 拾取检测
         for i in list(self.items):
             for p in self.players.values():
                 if not p.alive:
@@ -305,9 +265,7 @@ class GameServer:
         elif t == "giant":
             p.buffs["giant"] = 15.0
 
-
     def update_player(self, p: Player, dt: float):
-        """每秒物理：所有常量已转为每秒值，乘以实际 dt"""
         if not p.alive:
             p.dead_timer -= dt
             if p.dead_timer <= 0:
@@ -322,23 +280,19 @@ class GameServer:
             if p.melee_timer <= 0:
                 p.melee_active = False
                 p.melee_hit_set.clear()
-        # 击退 — 线性减速抛物线
         if p.knockback_timer > 0:
             p.knockback_timer -= dt
-            # 线性阻力：每秒减少 knockback_drag px/s
             drag = p.knockback_drag * dt
             if p.vx > 0:
                 p.vx = max(0, p.vx - drag)
             elif p.vx < 0:
                 p.vx = min(0, p.vx + drag)
-            # 阻力结束时自动清除计时器
             if abs(p.vx) < 5:
                 p.vx = 0.0
                 p.knockback_timer = 0.0
-        # Buff 计时
         for bkey in list(p.buffs):
             if bkey == "explosive":
-                continue  # 次数型
+                continue
             p.buffs[bkey] -= dt
             if p.buffs[bkey] <= 0:
                 del p.buffs[bkey]
@@ -363,7 +317,6 @@ class GameServer:
             elif p.can_double_jump:
                 p.vy = _JUMP_PS * 0.85 * jump_mult
                 p.can_double_jump = False
-
         p.prev_jump = p.input_jump
         p.vy += _GRAVITY_PS * dt
         if p.vy > _MAX_FALL_PS:
@@ -393,11 +346,10 @@ class GameServer:
             px, py, pw, ph = plat
             if p.x + PLAYER_W <= px or p.x >= px + pw:
                 continue
-            # 按 S 时穿过平台（地面除外）
             if p.input_down and py < MAP_HEIGHT - 50:
                 continue
             player_bottom = p.y + PLAYER_H
-            prev_bottom = player_bottom - vy * dt  # vy 是每秒值
+            prev_bottom = player_bottom - vy * dt
             if vy >= -1.0 and prev_bottom <= py + 4 and player_bottom >= py - 4:
                 if py - PLAYER_H < best_y:
                     best_y = float(py - PLAYER_H)
@@ -464,7 +416,6 @@ class GameServer:
                 age = (now - b.spawn_time) / 0.6
                 speed_mult = 1.0 + min(age, 1.0) * 2.0
                 b.vx = b.init_vx * speed_mult
-                # 追踪最近的敌人
                 target = None
                 target_dist2 = float('inf')
                 for p in self.players.values():
@@ -513,7 +464,7 @@ class GameServer:
                         b.init_vx = b.vx
                         b.vy = -b.vy
                         b.owner_id = p.id
-                        b.spawn_time = now  # 重置生存时间
+                        b.spawn_time = now
                         new_bullets.append(b)
                         hit_player = True
                         break
@@ -572,6 +523,14 @@ class GameServer:
             if len(self.kill_feed) > 10:
                 self.kill_feed.pop(0)
             print(f"[击杀] {msg}")
+            # 队列高可靠击杀事件
+            self._pending_kill_events.append({
+                "type": "kill_event",
+                "killer_id": killer.id,
+                "victim_id": p.id,
+                "killer_name": killer.name,
+                "victim_name": p.name,
+            })
         else:
             print(f"[死亡] {p.name} 掉出地图")
 
@@ -601,12 +560,11 @@ class GameServer:
         for pid in to_remove:
             p = self.players.get(pid)
             if p:
-                self._remove_by_sock(p.sock, is_disconnect=False)
+                self._remove_by_addr(p.addr, is_disconnect=False)
 
     def remove_player(self, pid: int, is_disconnect: bool = False):
         p = self.players.pop(pid, None)
         if p:
-            self.sock_to_pid.pop(p.sock, None)
             if not is_disconnect:
                 msg = f"{p.name} 离开了游戏"
                 self.kill_feed.append(msg)
@@ -651,96 +609,55 @@ class GameServer:
 
     def broadcast_state(self):
         state = self.build_state()
-        self.broadcast(state)
+        self.broadcast(state, reliable=False)
+
+    def _flush_events(self):
+        """发送所有待处理的高可靠事件（击杀）"""
+        if not self._pending_kill_events or not self.node:
+            return
+        events = self._pending_kill_events[:]
+        self._pending_kill_events.clear()
+        for event in events:
+            for p in self.players.values():
+                self.node.send(p.addr, event, reliable=True)
+
+    # ── 主循环 ──
 
     def start(self):
-        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind(("0.0.0.0", self.port))
-        self.server_sock.listen(MAX_PLAYERS)
-        self.server_sock.setblocking(False)
-
-        # UDP 发现（仅广播响应，不影响游戏）
-        self.disc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.disc_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.disc_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        try:
-            self.disc_sock.bind(("0.0.0.0", self.port))
-            self.disc_sock.setblocking(False)
-        except OSError:
-            # 端口被占时发现不可用，不影响 TCP 游戏
-            print("  [警告] UDP 发现端口被占用，LAN 发现不可用")
-            self.disc_sock = None
-
+        self.node = UdpNode(port=self.port, broadcast=True)
         self.running = True
 
-        print(f"=== LAN Platform Battle 服务器 (TCP) ===")
+        print(f"=== LAN Platform Battle 服务器 (UDP) ===")
         print(f"端口: {self.port}  最大: {MAX_PLAYERS} 人")
         print(f"按 Ctrl+C 停止\n")
 
+        tick_interval = 1.0 / TICK_RATE
+
         while self.running:
             try:
-                read_socks = [self.server_sock]
-                if self.disc_sock:
-                    read_socks.append(self.disc_sock)
-                read_socks.extend(self._pending_socks)
-                for p in self.players.values():
-                    read_socks.append(p.sock)
+                loop_start = _clock()
 
-                try:
-                    readable, _, exceptional = select.select(
-                        read_socks, [], read_socks, 1.0 / TICK_RATE)
-                except OSError:
-                    continue
-
-                for sock in readable:
-                    if sock is self.server_sock:
-                        client_sock, addr = self.server_sock.accept()
-                        client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        client_sock.setblocking(False)
-                        self._pending_socks.append(client_sock)
-                        self._recv_buf[client_sock] = b''
+                # 1. 接收并处理所有消息
+                for addr, msg in self.node.recv_all():
+                    if msg.get("type") == "discover":
+                        self.node.send(addr, {"type": "here"}, reliable=False)
                         continue
-                    if sock is self.disc_sock:
-                        self._handle_discover(sock)
-                        continue
-                    while True:
-                        msg = self._recv_msg(sock)
-                        if msg is self._DISCONNECTED:
-                            self._remove_by_sock(sock)
-                            break
-                        if msg is None:
-                            break
-                        self.handle_message(sock, msg)
+                    self.handle_message(addr, msg)
 
-                # 额外轮询：处理有残留缓冲区但没有触发 select 的 socket
-                for p in list(self.players.values()):
-                    if p.sock not in readable:
-                        while True:
-                            msg = self._recv_msg(p.sock)
-                            if msg is self._DISCONNECTED:
-                                self._remove_by_sock(p.sock)
-                                break
-                            if msg is None:
-                                break
-                            self.handle_message(p.sock, msg)
-                for s in list(self._pending_socks):
-                    if s not in readable:
-                        while True:
-                            msg = self._recv_msg(s)
-                            if msg is self._DISCONNECTED:
-                                self._remove_by_sock(s)
-                                break
-                            if msg is None:
-                                break
-                            self.handle_message(s, msg)
-
-                for sock in exceptional:
-                    self._remove_by_sock(sock)
-
+                # 2. Tick 游戏逻辑
                 self.tick()
+
+                # 3. 广播游戏状态（低可靠）
                 if self.players:
                     self.broadcast_state()
+
+                # 4. 发送高可靠事件
+                self._flush_events()
+
+                # 速率限制 ~60Hz
+                elapsed = _clock() - loop_start
+                if elapsed < tick_interval:
+                    _time_module.sleep(tick_interval - elapsed)
 
             except Exception as e:
                 import traceback
@@ -749,20 +666,16 @@ class GameServer:
 
     def stop(self):
         self.running = False
-        for p in list(self.players.values()):
-            try:
-                p.sock.close()
-            except OSError:
-                pass
-        for s in self._pending_socks:
-            try:
-                s.close()
-            except OSError:
-                pass
-        if self.disc_sock:
-            self.disc_sock.close()
-        if self.server_sock:
-            self.server_sock.close()
+        if self.node:
+            # 发送一条简短 disconnect 通知
+            for p in list(self.players.values()):
+                try:
+                    self.node.send(p.addr, {"type": "server_stopped"},
+                                   reliable=False)
+                except OSError:
+                    pass
+            self.node.close()
+            self.node = None
         print("[服务器已停止]")
 
 

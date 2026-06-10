@@ -1,58 +1,20 @@
 """
-LAN Platform Battle — 游戏客户端 (TCP)
-pygame 渲染 + TCP 连接
+LAN Platform Battle — 游戏客户端 (UDP)
+pygame 渲染 + UDP 连接
 2D 平台跳跃 + 近战/枪械
 """
 import pygame
-import socket
 import json
 import time
 import math
 import sys
 import random
 
-# 单调时钟
 _clock = time.monotonic
 
 sys.path.insert(0, ".")
 from config import *
-
-
-# ── TCP 收发工具 ──
-
-def _send_msg(sock: socket.socket, data: dict):
-    """发送长度前缀 JSON 消息"""
-    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    try:
-        sock.sendall(len(payload).to_bytes(4, 'big') + payload)
-    except OSError:
-        pass
-
-
-def _recv_msg(sock: socket.socket, buf: bytearray) -> dict | None:
-    """从缓冲区提取一条 JSON 消息，先用 sock.recv 尝试读更多"""
-    try:
-        chunk = sock.recv(4096)
-        if chunk:
-            buf.extend(chunk)
-        else:
-            return None  # 断开
-    except socket.timeout:
-        pass  # 无新数据
-    except OSError:
-        return None
-
-    if len(buf) < 4:
-        return None
-    n = int.from_bytes(buf[:4], 'big')
-    if len(buf) < 4 + n:
-        return None
-    body = buf[4:4 + n]
-    buf[:] = buf[4 + n:]
-    try:
-        return json.loads(body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+from network import UdpNode
 
 
 # ── 中文字体 ──
@@ -96,6 +58,7 @@ def _get_font(size: int) -> pygame.font.Font:
 class GameClient:
 
     def __init__(self):
+        self.node = UdpNode(broadcast=True)  # 用于 LAN 发现 + 游戏通信
         self.server_addr: tuple[str, int] | None = None
         self.pid: int | None = None
         self.color: list[int] = [255, 255, 255]
@@ -112,159 +75,148 @@ class GameClient:
         self.weapon = 0
         self.facing = 1
 
-        self.sock: socket.socket | None = None
         self.prev_hp: dict[int, int] = {}
         self.hit_flash: dict[int, float] = {}
         self._got_first_state = False
         self._last_state_time = 0.0
-        self._recv_buf = bytearray()
-        self._melee_anim: dict[int, float] = {}  # pid -> start_time
-        self._shake = 0.0  # 屏幕震动强度
-        self._particles: list[dict] = []  # 粒子效果
-        self._prev_vy: dict[int, float] = {}  # 落地检测
-        self._head_x: dict[int, float] = {}  # 头部惯性追踪
-        self._size_scale: dict[int, float] = {}  # 巨大化缩放
-        self._heal_flash: dict[int, float] = {}  # 回血闪绿
-        self._death_anim: dict[int, float] = {}  # 死亡动画
-        self._dead_done: set[int] = set()  # 已完成死亡爆炸
+        self._melee_anim: dict[int, float] = {}
+        self._shake = 0.0
+        self._particles: list[dict] = []
+        self._prev_vy: dict[int, float] = {}
+        self._head_x: dict[int, float] = {}
+        self._size_scale: dict[int, float] = {}
+        self._heal_flash: dict[int, float] = {}
+        self._death_anim: dict[int, float] = {}
+        self._dead_done: set[int] = set()
 
-    # ── LAN 发现（保留 UDP 单包交换）──
+    # ── LAN 发现 ──
 
     def discover_server(self, timeout: float = 2.0) -> str | None:
         print("正在扫描局域网游戏服务器 ...")
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.settimeout(timeout)
-        try:
-            msg = json.dumps({"type": "discover"}).encode("utf-8")
-            s.sendto(msg, ("255.255.255.255", SERVER_PORT))
-            start = time.time()
-            while time.time() - start < timeout:
-                try:
-                    data, addr = s.recvfrom(4096)
-                    if json.loads(data).get("type") == "here":
-                        return addr[0]
-                except (socket.timeout, json.JSONDecodeError, OSError):
-                    continue
-        except OSError:
-            pass
-        finally:
-            s.close()
+        self.node.send(("255.255.255.255", SERVER_PORT),
+                       {"type": "discover"}, reliable=False)
+        start = time.time()
+        while time.time() - start < timeout:
+            for addr, msg in self.node.recv_all():
+                if msg.get("type") == "here":
+                    return addr[0]
+            time.sleep(0.01)
         return None
 
-    # ── TCP 连接 ──
+    # ── UDP 连接 ──
 
     def connect(self, server_ip: str, port: int = SERVER_PORT,
                 player_name: str = "") -> bool:
         self.server_addr = (server_ip, port)
-        self._recv_buf = bytearray()
-        self._melee_anim: dict[int, float] = {}  # pid -> start_time
-        self._shake = 0.0  # 屏幕震动强度
-        self._particles: list[dict] = []  # 粒子效果
-        self._prev_vy: dict[int, float] = {}  # 落地检测
-        self._head_x: dict[int, float] = {}  # 头部惯性追踪
-        self._size_scale: dict[int, float] = {}  # 巨大化缩放
-        self._heal_flash: dict[int, float] = {}  # 回血闪绿
-        self._death_anim: dict[int, float] = {}  # 死亡动画
-        self._dead_done: set[int] = set()  # 已完成死亡爆炸
+
+        # 重置状态
+        self._melee_anim.clear()
+        self._shake = 0.0
+        self._particles.clear()
+        self._prev_vy.clear()
+        self._head_x.clear()
+        self._size_scale.clear()
+        self._heal_flash.clear()
+        self._death_anim.clear()
+        self._dead_done.clear()
+        self.kill_msgs.clear()
+        self._got_first_state = False
+        self._last_state_time = 0.0
 
         if not player_name:
             player_name = f"玩家{random.randint(10, 99)}"
 
         print(f"连接 {server_ip}:{port} ...")
 
-        # 建立 TCP 连接
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.sock.settimeout(5.0)
-        try:
-            self.sock.connect(self.server_addr)
-        except (ConnectionError, OSError, socket.timeout) as e:
-            print(f"  连接失败: {e}")
-            self.sock.close()
-            self.sock = None
-            return False
+        # 发送 join（高可靠：序列号 + ACK + 自动重试）
+        self.node.send(self.server_addr,
+                       {"type": "join", "name": player_name}, reliable=True)
 
-        # 发送 join
-        self.sock.settimeout(5.0)
-        _send_msg(self.sock, {"type": "join", "name": player_name})
+        # 等待 welcome（高可靠）
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            for addr, msg in self.node.recv_all():
+                if addr != self.server_addr:
+                    continue
+                if msg.get("type") == "welcome":
+                    self.pid = msg["pid"]
+                    self.color = msg.get("color", [255, 255, 255])
+                    self.server_tick = msg.get("server_tick", TICK_RATE)
+                    self.connected = True
+                    print(f"  收到 welcome, ID={self.pid}")
+                    return self._wait_initial_state()
+                elif msg.get("type") == "error":
+                    print(f"  {msg.get('message', '未知错误')}")
+                    return False
+            time.sleep(0.01)
 
-        # 等待 welcome
-        try:
-            self.sock.settimeout(5.0)
-            msg = _recv_msg(self.sock, self._recv_buf)
-            if msg and msg.get("type") == "welcome":
-                self.pid = msg["pid"]
-                self.color = msg.get("color", [255, 255, 255])
-                self.server_tick = msg.get("server_tick", TICK_RATE)
-                self.connected = True
-                print(f"  收到 welcome, ID={self.pid}")
-            else:
-                print(f"  未收到 welcome: {msg}")
-                return False
-        except (ConnectionError, OSError) as e:
-            print(f"  接收 welcome 失败: {e}")
-            return False
+        print(f"  加入超时")
+        return False
 
-        # 等待第一个状态帧
+    def _wait_initial_state(self) -> bool:
+        """等待第一个 state 消息"""
         print("  等待初始状态 ...")
-        _send_msg(self.sock, {
+        self.node.send(self.server_addr, {
             "type": "input", "keys": {}, "weapon": 0,
             "attack": False, "facing": 1,
-        })
+        }, reliable=False)
 
-        self.sock.settimeout(0.1)
         deadline = time.time() + 4.0
         while time.time() < deadline:
-            msg = _recv_msg(self.sock, self._recv_buf)
-            if msg and msg.get("type") == "state":
-                self.handle_state(msg)
-                if self.pid in self.players:
-                    print(f"  初始状态就绪, 在线 {len(self.players)} 人")
-                    self.sock.settimeout(None)
-                    return True
+            for addr, msg in self.node.recv_all():
+                if addr != self.server_addr:
+                    continue
+                if msg.get("type") == "state":
+                    self.handle_state(msg)
+                    if self.pid in self.players:
+                        print(f"  初始状态就绪, 在线 {len(self.players)} 人")
+                        return True
+            time.sleep(0.01)
 
         print("  初始状态未到, 继续游戏循环")
-        self.sock.settimeout(None)
         return True
 
     def disconnect(self):
         self.connected = False
-        if self.sock:
-            # 通知服务器
-            try:
-                _send_msg(self.sock, {"type": "disconnect"})
-            except OSError:
-                pass
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            self.sock = None
+        if self.node and self.server_addr:
+            # 发送断开通知（高可靠）
+            self.node.send(self.server_addr,
+                           {"type": "disconnect"}, reliable=True)
+            time.sleep(0.05)
+        if self.node:
+            self.node.close()
+            self.node = None
 
     # ── 网络收发 ──
 
     def send_input(self):
-        if not self.sock:
+        if not self.node or not self.server_addr:
             return
-        _send_msg(self.sock, {
+        self.node.send(self.server_addr, {
             "type": "input",
             "keys": self.keys,
             "weapon": self.weapon,
             "attack": self.attack,
             "facing": self.facing,
-        })
+        }, reliable=False)
 
     def receive_state(self):
-        if not self.sock:
+        if not self.node or not self.server_addr:
             return
-        self.sock.settimeout(0.001)
-        while True:
-            msg = _recv_msg(self.sock, self._recv_buf)
-            if msg is None:
-                break
-            if msg.get("type") == "state":
+        for addr, msg in self.node.recv_all():
+            if addr != self.server_addr:
+                continue
+            t = msg.get("type")
+            if t == "state":
                 self.handle_state(msg)
+            elif t == "kill_event":
+                self.handle_kill_event(msg)
+
+    def handle_kill_event(self, msg: dict):
+        """高可靠击杀事件（必达 + 保序）"""
+        now = _clock()
+        text = f"{msg.get('killer_name', '?')} 淘汰了 {msg.get('victim_name', '?')}"
+        self.kill_msgs.append((text, now))
 
     def handle_state(self, msg: dict):
         now = _clock()
@@ -280,7 +232,6 @@ class GameClient:
                 self.spawn_particles(pd.get("x", 0) + 12, pd.get("y", 0) + 17, color2, 6)
                 if pd["id"] == self.pid:
                     self.trigger_shake(6)
-            # 死亡动画触发（仅一次）
             if not pd["alive"] and pd["id"] not in self._death_anim and pd["id"] not in self._dead_done:
                 self._death_anim[pd["id"]] = now
                 self.trigger_shake(8)
@@ -289,7 +240,6 @@ class GameClient:
             if pd["alive"]:
                 self._death_anim.pop(pd["id"], None)
                 self._dead_done.discard(pd["id"])
-            # 回血闪绿 + 粒子
             if pd["alive"] and old_hp < pd["hp"]:
                 self._heal_flash[pid] = now
                 for _ in range(12):
@@ -301,7 +251,6 @@ class GameClient:
                         "life": random.uniform(0.3, 0.6),
                         "color": (80, 255, 80),
                     })
-            # 二段跳检测
             prev_vy2 = self._prev_vy.get(pid, 0)
             cur_vy2 = pd.get("vy", 0)
             if pd.get("alive") and cur_vy2 < -200 and prev_vy2 > -50:
@@ -314,7 +263,6 @@ class GameClient:
                         "life": random.uniform(0.2, 0.4),
                         "color": (200, 200, 255),
                     })
-            # 落地检测 + 行走粒子
             prev_vy = self._prev_vy.get(pid, 0)
             cur_vy = pd.get("vy", 0)
             cur_vx = pd.get("vx", 0)
@@ -329,24 +277,20 @@ class GameClient:
                 self.spawn_particles(lx, ly, (180, 180, 200), 5)
             self._prev_vy[pid] = cur_vy
             self.prev_hp[pid] = pd["hp"]
-            # 近战动画追踪
             if pd.get("melee_active") and pid not in self._melee_anim:
                 self._melee_anim[pid] = now
             elif not pd.get("melee_active") and pid in self._melee_anim:
                 del self._melee_anim[pid]
 
-        # 爆裂弹追踪（按 owner_id 稳定匹配）
         cur_eb = {b["owner_id"]: b for b in self.bullets if b.get("explosive")}
         old_eb_ids = set(getattr(self, '_prev_eb_ids', set()))
         self.players = {p["id"]: p for p in msg.get("players", [])}
-        # 巨大化缩放追踪
         for pl2 in self.players.values():
             target = 2.0 if "giant" in pl2.get("buffs", {}) else 1.0
             cur = self._size_scale.get(pl2["id"], 1.0)
             self._size_scale[pl2["id"]] = cur + (target - cur) * 0.15
         self.bullets = msg.get("bullets", [])
         self._state_items = msg.get("items", [])
-        # 爆裂弹飞行爆炸（每帧爆炸 + 持续震动）
         for ob in cur_eb.values():
             for _ in range(25):
                 a2 = random.uniform(0, 6.283)
@@ -358,11 +302,9 @@ class GameClient:
                     "color": (255, random.randint(80, 200), 20),
                 })
             self.trigger_shake(4)
-        # 检测爆裂弹消失 → 大爆炸
         new_ids = set(cur_eb.keys())
         gone_ids = old_eb_ids - new_ids
         for gid in gone_ids:
-            # 从 old_eb 取最后位置
             bx, by = 0, 0
             if hasattr(self, '_last_eb_pos') and gid in self._last_eb_pos:
                 bx, by = self._last_eb_pos[gid]
@@ -384,12 +326,10 @@ class GameClient:
                     "color": (255, 255, 200),
                 })
             self.trigger_shake(14)
-        # 记录下一帧用
         self._prev_eb_ids = new_ids
         self._last_eb_pos = {oid: (b["x"], b["y"]) for oid, b in cur_eb.items()}
         self._got_first_state = True
 
-        # 断线检测
         if self.pid is not None and self.pid in self.players:
             self._last_state_time = now
         elif self._got_first_state and self.pid is not None:
@@ -401,14 +341,12 @@ class GameClient:
 
     @staticmethod
     def draw_background(surf: pygame.Surface):
-        # 垂直渐变背景
         for y in range(MAP_HEIGHT):
             t = y / MAP_HEIGHT
             r = int(28 + t * 20)
             g = int(28 + t * 30)
             b = int(48 + t * 40)
             pygame.draw.line(surf, (r, g, b), (0, y), (MAP_WIDTH, y))
-        # 网格（半透明）
         for x in range(0, MAP_WIDTH, 50):
             pygame.draw.line(surf, (60, 60, 90, 60), (x, 0), (x, MAP_HEIGHT))
         for y in range(0, MAP_HEIGHT, 50):
@@ -418,12 +356,10 @@ class GameClient:
     def draw_platforms(surf: pygame.Surface):
         for plat in PLATFORMS:
             px, py, pw, ph = plat
-            # 底部微光
             for i in range(8, 0, -2):
                 glow = pygame.Surface((pw + i * 2, ph + i * 2), pygame.SRCALPHA)
                 glow.fill((72, 72, 112, 15))
                 surf.blit(glow, (px - i, py - i))
-            # 主体
             pygame.draw.rect(surf, COLOR_PLATFORM, (px, py, pw, ph))
             pygame.draw.line(surf, COLOR_PLATFORM_TOP,
                              (px, py), (px + pw, py), 2)
@@ -439,7 +375,6 @@ class GameClient:
             is_me = (p["id"] == my_pid)
             alive = p.get("alive", True)
 
-            # 死亡爆炸
             d_start = self._death_anim.get(p["id"])
             if d_start and not alive:
                 d_prog = min(1.0, (now - d_start) / 0.25)
@@ -456,16 +391,13 @@ class GameClient:
                             "color": (255, random.randint(80, 200), 20),
                         })
                     self.trigger_shake(12)
-                # 爆心闪白
                 pygame.draw.circle(surf, (255, 255, 200, 180),
                                    (int(px + 12), int(py + 17)),
                                    int(15 * (1 - d_prog)) + 5)
                 continue
-            # 死亡后不绘制
             if not alive:
                 continue
 
-            # 阴影（仅存活时绘制）
             shadow = pygame.Surface((PLAYER_W, 6), pygame.SRCALPHA)
             shadow.fill((0, 0, 0, 60))
             surf.blit(shadow, (round(px), round(py + PLAYER_H - 2)))
@@ -477,7 +409,6 @@ class GameClient:
             buffs = p.get("buffs", {})
             has_explosive = "explosive" in buffs
             has_shield = "shield" in buffs
-            # 颜色优先级：闪白 > 爆裂橙 > 回血绿 > 回血渐变 > 原色
             if flash_on:
                 body_color = (255, 255, 255)
             elif has_explosive:
@@ -485,7 +416,6 @@ class GameClient:
             elif heal_on:
                 t_h = (now - heal_f) / 0.4
                 body_color = tuple(int(255 * (1 - t_h) + c * t_h) for c in color)
-                # 绿色光环
                 gr = max(PLAYER_W, PLAYER_H) + int(20 * (1 - t_h))
                 gs = pygame.Surface((gr*2, gr*2), pygame.SRCALPHA)
                 pygame.draw.circle(gs, (80, 255, 80, int(120 * (1 - t_h))),
@@ -494,14 +424,12 @@ class GameClient:
             else:
                 body_color = color
 
-            # 巨大化缩放
             scale = self._size_scale.get(p["id"], 1.0)
             sw = int(PLAYER_W * scale)
             sh = int(PLAYER_H * scale)
-            sx_off = (sw - PLAYER_W) // 2  # 保持居中
-            sy_off = sh - PLAYER_H       # 底部固定
+            sx_off = (sw - PLAYER_W) // 2
+            sy_off = sh - PLAYER_H
 
-            # 玩家底部光晕
             glow_s = pygame.Surface((sw + 16, sh + 16), pygame.SRCALPHA)
             for r in range(12, 0, -3):
                 pygame.draw.ellipse(glow_s, (*color[:3], 12),
@@ -514,7 +442,6 @@ class GameClient:
             bc = (255, 255, 255) if is_me else (180, 180, 180)
             pygame.draw.rect(surf, bc, rect, bw, border_radius=3)
 
-            # 护盾光环（正圆）
             if has_shield:
                 s_r = max(sw, sh) // 2 + int(14 * scale)
                 cx_p = round(px - sx_off + sw // 2)
@@ -601,11 +528,24 @@ class GameClient:
                 pygame.draw.rect(surf, hpc, (bx, by, fw, 4))
             pygame.draw.rect(surf, (80, 80, 80), (bx, by, bw2, 4), 1)
 
+    def draw_kill_feed(self, surf: pygame.Surface, font_small):
+        """绘制击杀信息（来自高可靠 kill_event 消息）"""
+        now = _clock()
+        # 清理过期消息
+        self.kill_msgs = [(t, ts) for t, ts in self.kill_msgs if now - ts < 5.0]
+        y = 30
+        for text, ts in reversed(self.kill_msgs[-5:]):
+            age = now - ts
+            alpha = max(0, min(255, int(255 * (1 - age / 5.0))))
+            label = font_small.render(text, True, (255, 240, 100))
+            label.set_alpha(alpha)
+            surf.blit(label, (12, y))
+            y += 22
+
     def draw_items(self, surf: pygame.Surface):
         items = getattr(self, '_state_items', [])
         for it in items:
             x, y = it["x"], it["y"]
-            # 发光方块（放大尺寸）
             col = (180, 140, 255)
             for r in range(12, 0, -3):
                 s = pygame.Surface((r*4, r*4), pygame.SRCALPHA)
@@ -613,7 +553,7 @@ class GameClient:
                 surf.blit(s, (x - r*2, y - r*2))
             sz = 18
             pygame.draw.rect(surf, col, (x - sz//2, y - sz//2, sz, sz))
-            pygame.draw.rect(surf, (255,255,255), (x - sz//2, y - sz//2, sz, sz), 2)
+            pygame.draw.rect(surf, (255, 255, 255), (x - sz//2, y - sz//2, sz, sz), 2)
 
     def draw_bullets(self, surf: pygame.Surface):
         for b in self.bullets:
@@ -633,12 +573,11 @@ class GameClient:
         self._shake = max(self._shake, intensity)
 
     def spawn_particles(self, x, y, color, count=8):
-        import math as m
         for _ in range(count):
-            a = random.uniform(0, m.pi * 2)
+            a = random.uniform(0, math.pi * 2)
             sp = random.uniform(30, 100)
             self._particles.append({
-                "x": x, "y": y, "vx": m.cos(a) * sp, "vy": m.sin(a) * sp,
+                "x": x, "y": y, "vx": math.cos(a) * sp, "vy": math.sin(a) * sp,
                 "life": random.uniform(0.3, 0.6), "color": color,
             })
 
@@ -648,7 +587,7 @@ class GameClient:
         for p in self._particles:
             p["x"] += p["vx"] * 0.016
             p["y"] += p["vy"] * 0.016
-            p["vy"] += 200 * 0.016  # 粒子重力
+            p["vy"] += 200 * 0.016
             p["life"] -= 0.016
             if p["life"] <= 0:
                 dead.append(p)
@@ -661,7 +600,6 @@ class GameClient:
             self._particles.remove(p)
 
     def draw_vignette(self, surf: pygame.Surface):
-        # 低血量红色晕影
         my_hp = 0
         if self.pid is not None and self.pid in self.players:
             my_hp = self.players[self.pid].get("hp", 100)
@@ -674,7 +612,6 @@ class GameClient:
                     continue
                 pygame.draw.circle(vg, (180, 20, 20, a),
                                    (WIDTH // 2, HEIGHT // 2), r, 2)
-            surf.blit(vg, (0, 0))
 
     def draw_hud(self, surf: pygame.Surface, font, font_large, font_small):
         now = _clock()
@@ -693,9 +630,9 @@ class GameClient:
             is_me = (p["id"] == self.pid)
             alive = p.get("alive", True)
             pygame.draw.circle(surf, color, (WIDTH - 160, y + 5), 5)
-            st = "" if alive else " †"
+            st = "" if alive else " \u2020"
             pf = "> " if is_me else "  "
-            text = f"{pf}{p.get('name','?')[:7]}{st}  {p.get('kills',0)}杀 {p.get('deaths',0)}死"
+            text = f"{pf}{p.get('name','?')[:7]}{st}  {p.get('kills',0)}\u6740 {p.get('deaths',0)}\u6b7b"
             clr = (255, 255, 255) if is_me else (200, 200, 200)
             label = font_small.render(text, True, clr)
             surf.blit(label, (WIDTH - 148, y))
@@ -719,14 +656,15 @@ class GameClient:
         sr.bottom = HEIGHT - 4
         surf.blit(st, sr)
 
-        # Buff 文字（含剩余时间）
         if self.pid is not None and self.pid in self.players:
             raw = self.players[self.pid].get("buffs", {})
-            bnames = {"speed":"加速","shield":"护盾","explosive":"爆裂","giant":"巨大化"}
+            bnames = {"speed": "加速", "shield": "护盾",
+                      "explosive": "爆裂", "giant": "巨大化"}
             items = []
-            for bk, bv in sorted(raw.items(), key=lambda x: -x[1] if isinstance(x[1], (int,float)) else 0):
+            for bk, bv in sorted(raw.items(),
+                                 key=lambda x: -x[1] if isinstance(x[1], (int, float)) else 0):
                 label = bnames.get(bk, bk)
-                if bk in ("speed", "giant", "shield") and isinstance(bv, (int,float)):
+                if bk in ("speed", "giant", "shield") and isinstance(bv, (int, float)):
                     label += f" {bv:.0f}s"
                 elif bk == "explosive":
                     label += " \u25cf"
@@ -735,7 +673,6 @@ class GameClient:
                 txt = " | ".join(items[:3])
                 lbl = font_small.render(txt, True, (255, 230, 100))
                 surf.blit(lbl, (12, HEIGHT - 62))
-
 
     # ── 主循环 ──
 
@@ -763,7 +700,6 @@ class GameClient:
                 elif event.type == pygame.KEYUP:
                     self._on_key(event.key, False)
 
-            # J=射击  K=近战  鼠标左键=射击
             if self.melee_pressed:
                 self.weapon = 0
                 self.attack = True
@@ -778,30 +714,29 @@ class GameClient:
             elif self.keys["right"]:
                 self.facing = 1
 
-            if self.connected and self.pid is not None:
+            if self.connected and self.pid is not None and self.node:
                 disconnect_logged = False
                 self.send_input()
                 self.receive_state()
 
-                # 断线检测
                 if self._got_first_state and _clock() - self._last_state_time > 3.0:
                     self.connected = False
                     continue
 
-                # 震动衰减
                 if self._shake > 0:
                     self._shake *= 0.85
                     if self._shake < 0.5:
                         self._shake = 0.0
                 shake_off = (random.randint(-int(self._shake), int(self._shake)),
                              random.randint(-int(self._shake), int(self._shake)))
-                # 绘制到临时画布实现震动
+
                 canvas = pygame.Surface((WIDTH, HEIGHT))
                 self.draw_background(canvas)
                 self.draw_platforms(canvas)
                 self.draw_items(canvas)
                 self.draw_bullets(canvas)
                 self.draw_players(canvas, font_small)
+                self.draw_kill_feed(canvas, font_small)
                 self.draw_particles(canvas)
                 self.draw_vignette(canvas)
                 self.draw_hud(canvas, font, font_large, font_small)
@@ -845,7 +780,6 @@ class GameClient:
                 self.weapon = 0
             elif key == pygame.K_2:
                 self.weapon = 1
-
 
 
 # ── 启动 ──
